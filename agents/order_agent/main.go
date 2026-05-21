@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -39,11 +40,19 @@ type TaskResult struct {
 	TraceID string                 `json:"trace_id"`
 }
 
+// Bid is sent to the orchestrator during auction phase.
+type Bid struct {
+	TaskID  string  `json:"task_id"`
+	AgentID string  `json:"agent_id"`
+	Cost    float64 `json:"cost"`      // lower = more available
+	TaskType string `json:"task_type"`
+}
+
 var (
 	agentID   = getenv("AGENT_ID", "order-agent-1")
 	natsURL   = getenv("NATS_URL", "nats://localhost:4222")
 	otlpEndpt = getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
-	processed int64
+	processed atomic.Int64
 	logger    = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 )
 
@@ -75,6 +84,13 @@ func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
 	return tp, nil
 }
 
+// currentCost returns this agent's bid cost based on current load.
+// Lower processed count = lower cost = more available.
+func currentCost() float64 {
+	p := processed.Load()
+	return 1.0 + float64(p)*0.1
+}
+
 // validateOrder checks required fields and business rules.
 func validateOrder(payload map[string]interface{}) (map[string]interface{}, error) {
 	orderID, ok := payload["order_id"].(string)
@@ -90,7 +106,6 @@ func validateOrder(payload map[string]interface{}) (map[string]interface{}, erro
 		return nil, fmt.Errorf("invalid table_number")
 	}
 
-	// Calculate total
 	total := 0.0
 	for _, raw := range items {
 		item, ok := raw.(map[string]interface{})
@@ -105,11 +120,7 @@ func validateOrder(payload map[string]interface{}) (map[string]interface{}, erro
 		total += price * qty
 	}
 
-	logger.Info("order validated",
-		"order_id", orderID,
-		"items_count", len(items),
-		"total", total,
-	)
+	logger.Info("order validated", "order_id", orderID, "items_count", len(items), "total", total)
 
 	return map[string]interface{}{
 		"order_id":     orderID,
@@ -122,7 +133,7 @@ func validateOrder(payload map[string]interface{}) (map[string]interface{}, erro
 }
 
 func handleTask(nc *nats.Conn, msg *nats.Msg) {
-	processed++
+	processed.Add(1)
 	start := time.Now()
 
 	var task Task
@@ -132,7 +143,6 @@ func handleTask(nc *nats.Conn, msg *nats.Msg) {
 	}
 
 	if task.Type != "validate_order" {
-		logger.Debug("skipping task type", "type", task.Type)
 		return
 	}
 
@@ -142,18 +152,10 @@ func handleTask(nc *nats.Conn, msg *nats.Msg) {
 	span.SetAttributes(attribute.String("task.id", task.ID))
 	_ = ctx
 
-	logger.Info("processing task",
-		"task_id", task.ID,
-		"agent", agentID,
-		"retry", task.RetryCount,
-	)
+	logger.Info("processing task", "task_id", task.ID, "agent", agentID, "retry", task.RetryCount)
 
 	output, err := validateOrder(task.Payload)
-	result := TaskResult{
-		TaskID:  task.ID,
-		AgentID: agentID,
-		TraceID: task.TraceID,
-	}
+	result := TaskResult{TaskID: task.ID, AgentID: agentID, TraceID: task.TraceID}
 	if err != nil {
 		result.Success = false
 		result.Error = err.Error()
@@ -172,8 +174,31 @@ func handleTask(nc *nats.Conn, msg *nats.Msg) {
 		"task_id", task.ID,
 		"success", result.Success,
 		"elapsed_ms", time.Since(start).Milliseconds(),
-		"processed_total", processed,
+		"processed_total", processed.Load(),
 	)
+}
+
+// handleBid responds to auction requests from the orchestrator.
+func handleBid(nc *nats.Conn, msg *nats.Msg) {
+	var task Task
+	if err := json.Unmarshal(msg.Data, &task); err != nil {
+		return
+	}
+	if task.Type != "validate_order" {
+		return
+	}
+
+	bid := Bid{
+		TaskID:   task.ID,
+		AgentID:  agentID,
+		Cost:     currentCost(),
+		TaskType: task.Type,
+	}
+	data, _ := json.Marshal(bid)
+	if err := nc.Publish("tasks.bids", data); err != nil {
+		logger.Error("publish bid", "error", err)
+	}
+	logger.Debug("bid submitted", "task_id", task.ID, "cost", bid.Cost)
 }
 
 func main() {
@@ -198,16 +223,37 @@ func main() {
 	}
 	defer nc.Drain()
 
-	sub, err := nc.QueueSubscribe("tasks.process", "order-agents", func(msg *nats.Msg) {
+	// Auction: respond to bid requests
+	bidSub, err := nc.Subscribe("tasks.bid", func(msg *nats.Msg) {
+		handleBid(nc, msg)
+	})
+	if err != nil {
+		logger.Error("subscribe bid", "error", err)
+		os.Exit(1)
+	}
+	defer bidSub.Unsubscribe()
+
+	// Direct: receive tasks won at auction
+	directSub, err := nc.Subscribe("tasks.direct."+agentID, func(msg *nats.Msg) {
 		handleTask(nc, msg)
 	})
 	if err != nil {
-		logger.Error("subscribe", "error", err)
+		logger.Error("subscribe direct", "error", err)
 		os.Exit(1)
 	}
-	defer sub.Unsubscribe()
+	defer directSub.Unsubscribe()
+
+	// Fallback: also handle broadcast tasks (retry path)
+	broadSub, err := nc.QueueSubscribe("tasks.process", "order-agents", func(msg *nats.Msg) {
+		handleTask(nc, msg)
+	})
+	if err != nil {
+		logger.Error("subscribe broadcast", "error", err)
+		os.Exit(1)
+	}
+	defer broadSub.Unsubscribe()
 
 	logger.Info("order-agent started", "agent_id", agentID, "nats", natsURL)
 	<-ctx.Done()
-	logger.Info("order-agent shutting down", "processed", processed)
+	logger.Info("order-agent shutting down", "processed", processed.Load())
 }

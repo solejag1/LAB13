@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -22,7 +23,6 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
-// Task represents an incoming task from the orchestrator.
 type Task struct {
 	ID         string                 `json:"id"`
 	Type       string                 `json:"type"`
@@ -31,7 +31,6 @@ type Task struct {
 	RetryCount int                    `json:"retry_count"`
 }
 
-// TaskResult is sent back to the orchestrator.
 type TaskResult struct {
 	TaskID  string                 `json:"task_id"`
 	Success bool                   `json:"success"`
@@ -41,12 +40,20 @@ type TaskResult struct {
 	TraceID string                 `json:"trace_id"`
 }
 
+type Bid struct {
+	TaskID   string  `json:"task_id"`
+	AgentID  string  `json:"agent_id"`
+	Cost     float64 `json:"cost"`
+	TaskType string  `json:"task_type"`
+}
+
 var (
 	agentID   = getenv("AGENT_ID", "kitchen-agent-1")
 	natsURL   = getenv("NATS_URL", "nats://localhost:4222")
 	redisURL  = getenv("REDIS_URL", "redis://localhost:6379")
 	otlpEndpt = getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
-	processed int64
+	processed atomic.Int64
+	active    atomic.Int64 // currently processing tasks — used for bid cost
 	logger    = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	rdb       *redis.Client
 )
@@ -90,7 +97,11 @@ func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
 	return tp, nil
 }
 
-// cookDish simulates cooking and tracks state in Redis.
+// currentCost returns bid cost: idle agent bids low, busy agent bids high.
+func currentCost() float64 {
+	return 1.0 + float64(active.Load())*2.0
+}
+
 func cookDish(ctx context.Context, payload map[string]interface{}) (map[string]interface{}, error) {
 	orderID, ok := payload["order_id"].(string)
 	if !ok || orderID == "" {
@@ -98,41 +109,40 @@ func cookDish(ctx context.Context, payload map[string]interface{}) (map[string]i
 	}
 	items, _ := payload["items"].([]interface{})
 
-	// Record cooking start in Redis
-	stateKey := fmt.Sprintf("kitchen:order:%s", orderID)
-	pipe := rdb.Pipeline()
-	pipe.HSet(ctx, stateKey,
-		"order_id", orderID,
-		"status", "cooking",
-		"agent_id", agentID,
-		"started_at", time.Now().UTC().Format(time.RFC3339),
-		"items_count", strconv.Itoa(len(items)),
-	)
-	pipe.Expire(ctx, stateKey, 24*time.Hour)
-
-	// Increment processed counter in Redis
-	pipe.Incr(ctx, fmt.Sprintf("kitchen:agent:%s:processed", agentID))
-	if _, err := pipe.Exec(ctx); err != nil {
-		logger.Warn("redis pipeline", "error", err)
+	// Redis state — safe nil check
+	if rdb != nil {
+		stateKey := fmt.Sprintf("kitchen:order:%s", orderID)
+		pipe := rdb.Pipeline()
+		pipe.HSet(ctx, stateKey,
+			"order_id", orderID,
+			"status", "cooking",
+			"agent_id", agentID,
+			"started_at", time.Now().UTC().Format(time.RFC3339),
+			"items_count", strconv.Itoa(len(items)),
+		)
+		pipe.Expire(ctx, stateKey, 24*time.Hour)
+		pipe.Incr(ctx, fmt.Sprintf("kitchen:agent:%s:processed", agentID))
+		if _, err := pipe.Exec(ctx); err != nil {
+			logger.Warn("redis pipeline", "error", err)
+		}
 	}
 
-	// Simulate cooking time proportional to item count
 	cookTime := time.Duration(len(items)) * 200 * time.Millisecond
 	if cookTime > 2*time.Second {
 		cookTime = 2 * time.Second
 	}
 	time.Sleep(cookTime)
 
-	// Mark as ready
-	if err := rdb.HSet(ctx, stateKey, "status", "ready", "ready_at", time.Now().UTC().Format(time.RFC3339)).Err(); err != nil {
-		logger.Warn("redis update ready", "error", err)
+	if rdb != nil {
+		if err := rdb.HSet(ctx, fmt.Sprintf("kitchen:order:%s", orderID),
+			"status", "ready",
+			"ready_at", time.Now().UTC().Format(time.RFC3339),
+		).Err(); err != nil {
+			logger.Warn("redis update ready", "error", err)
+		}
 	}
 
-	logger.Info("dishes cooked",
-		"order_id", orderID,
-		"items_count", len(items),
-		"cook_time_ms", cookTime.Milliseconds(),
-	)
+	logger.Info("dishes cooked", "order_id", orderID, "items_count", len(items), "cook_time_ms", cookTime.Milliseconds())
 
 	return map[string]interface{}{
 		"order_id":  orderID,
@@ -144,7 +154,9 @@ func cookDish(ctx context.Context, payload map[string]interface{}) (map[string]i
 }
 
 func handleTask(nc *nats.Conn, msg *nats.Msg) {
-	processed++
+	processed.Add(1)
+	active.Add(1)
+	defer active.Add(-1)
 	start := time.Now()
 
 	var task Task
@@ -152,7 +164,6 @@ func handleTask(nc *nats.Conn, msg *nats.Msg) {
 		logger.Error("unmarshal task", "error", err)
 		return
 	}
-
 	if task.Type != "cook_dish" {
 		return
 	}
@@ -162,18 +173,10 @@ func handleTask(nc *nats.Conn, msg *nats.Msg) {
 	defer span.End()
 	span.SetAttributes(attribute.String("task.id", task.ID))
 
-	logger.Info("processing task",
-		"task_id", task.ID,
-		"agent", agentID,
-		"retry", task.RetryCount,
-	)
+	logger.Info("processing task", "task_id", task.ID, "agent", agentID, "retry", task.RetryCount)
 
 	output, err := cookDish(ctx, task.Payload)
-	result := TaskResult{
-		TaskID:  task.ID,
-		AgentID: agentID,
-		TraceID: task.TraceID,
-	}
+	result := TaskResult{TaskID: task.ID, AgentID: agentID, TraceID: task.TraceID}
 	if err != nil {
 		result.Success = false
 		result.Error = err.Error()
@@ -192,8 +195,24 @@ func handleTask(nc *nats.Conn, msg *nats.Msg) {
 		"task_id", task.ID,
 		"success", result.Success,
 		"elapsed_ms", time.Since(start).Milliseconds(),
-		"processed_total", processed,
+		"processed_total", processed.Load(),
 	)
+}
+
+func handleBid(nc *nats.Conn, msg *nats.Msg) {
+	var task Task
+	if err := json.Unmarshal(msg.Data, &task); err != nil {
+		return
+	}
+	if task.Type != "cook_dish" {
+		return
+	}
+	bid := Bid{TaskID: task.ID, AgentID: agentID, Cost: currentCost(), TaskType: task.Type}
+	data, _ := json.Marshal(bid)
+	if err := nc.Publish("tasks.bids", data); err != nil {
+		logger.Error("publish bid", "error", err)
+	}
+	logger.Debug("bid submitted", "task_id", task.ID, "cost", bid.Cost, "active", active.Load())
 }
 
 func main() {
@@ -222,17 +241,37 @@ func main() {
 	}
 	defer nc.Drain()
 
-	// Queue group ensures load balancing across multiple kitchen agents
-	sub, err := nc.QueueSubscribe("tasks.process", "kitchen-agents", func(msg *nats.Msg) {
+	// Auction: respond to bid requests
+	bidSub, err := nc.Subscribe("tasks.bid", func(msg *nats.Msg) {
+		handleBid(nc, msg)
+	})
+	if err != nil {
+		logger.Error("subscribe bid", "error", err)
+		os.Exit(1)
+	}
+	defer bidSub.Unsubscribe()
+
+	// Direct: receive tasks won at auction
+	directSub, err := nc.Subscribe("tasks.direct."+agentID, func(msg *nats.Msg) {
 		handleTask(nc, msg)
 	})
 	if err != nil {
-		logger.Error("subscribe", "error", err)
+		logger.Error("subscribe direct", "error", err)
 		os.Exit(1)
 	}
-	defer sub.Unsubscribe()
+	defer directSub.Unsubscribe()
+
+	// Fallback broadcast
+	broadSub, err := nc.QueueSubscribe("tasks.process", "kitchen-agents", func(msg *nats.Msg) {
+		handleTask(nc, msg)
+	})
+	if err != nil {
+		logger.Error("subscribe broadcast", "error", err)
+		os.Exit(1)
+	}
+	defer broadSub.Unsubscribe()
 
 	logger.Info("kitchen-agent started", "agent_id", agentID, "nats", natsURL)
 	<-ctx.Done()
-	logger.Info("kitchen-agent shutting down", "processed", processed)
+	logger.Info("kitchen-agent shutting down", "processed", processed.Load())
 }

@@ -1,0 +1,2 @@
+nats-py==2.7.2
+anthropic==0.28.0

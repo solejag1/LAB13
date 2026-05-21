@@ -169,3 +169,17 @@ services:
       - api
       - redis
     restart: unless-stopped
+
+  llm_agent:
+    build:
+      context: ./agents/llm_agent
+      dockerfile: Dockerfile
+    container_name: lab13_llm_agent
+    environment:
+      - NATS_URL=nats://nats:4222
+      - AGENT_ID=llm-agent-1
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped

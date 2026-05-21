@@ -35,7 +35,11 @@ class TestLifecycle:
             await orch.start()
 
         mock_nats.assert_called_once()
-        mock_nc.subscribe.assert_called_once_with("tasks.completed", cb=orch._on_result)
+        # start() now subscribes to tasks.completed AND tasks.bids
+        assert mock_nc.subscribe.call_count == 2
+        subjects = [c.args[0] for c in mock_nc.subscribe.call_args_list]
+        assert "tasks.completed" in subjects
+        assert "tasks.bids" in subjects
         assert orch._nc is mock_nc
 
     @pytest.mark.asyncio

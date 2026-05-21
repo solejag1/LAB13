@@ -1,13 +1,11 @@
 """
 Restaurant Order Orchestrator.
 
-Manages the full pipeline:
-  validate_order → assign_table → cook_dish → deliver_order
+Pipeline: validate_order → assign_table → cook_dish → deliver_order
 
 Features:
-- Async NATS messaging
-- Retry with exponential back-off (max 3 attempts)
-- Auction-based agent selection (agents bid on tasks)
+- Auction-based agent selection (agents bid on tasks, lowest cost wins)
+- Retry with exponential back-off (max 3 attempts) as fallback
 - Distributed tracing via OpenTelemetry → Jaeger
 - Order state persistence in Redis
 """
@@ -29,30 +27,21 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("orchestrator")
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 NATS_URL = os.getenv("NATS_URL", "nats://localhost:4222")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
 MAX_RETRIES = 3
-TASK_TIMEOUT = 30  # seconds
+TASK_TIMEOUT = 30
+BID_WINDOW = 0.3  # seconds to collect bids from agents
 
 
-# ---------------------------------------------------------------------------
-# OpenTelemetry setup
-# ---------------------------------------------------------------------------
 def init_tracer() -> trace.Tracer:
-    """Initialize OTLP tracer pointing at Jaeger."""
     try:
         resource = Resource.create({"service.name": "orchestrator"})
         provider = TracerProvider(resource=resource)
@@ -60,7 +49,7 @@ def init_tracer() -> trace.Tracer:
         provider.add_span_processor(BatchSpanProcessor(exporter))
         trace.set_tracer_provider(provider)
         logger.info("OpenTelemetry tracer initialised → %s", OTLP_ENDPOINT)
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc:
         logger.warning("Tracer init failed (no tracing): %s", exc)
     return trace.get_tracer("orchestrator")
 
@@ -68,9 +57,6 @@ def init_tracer() -> trace.Tracer:
 tracer = init_tracer()
 
 
-# ---------------------------------------------------------------------------
-# Data types
-# ---------------------------------------------------------------------------
 @dataclass
 class Task:
     id: str
@@ -90,9 +76,14 @@ class TaskResult:
     trace_id: str = ""
 
 
-# ---------------------------------------------------------------------------
-# Orchestrator
-# ---------------------------------------------------------------------------
+@dataclass
+class Bid:
+    task_id: str
+    agent_id: str
+    cost: float
+    task_type: str
+
+
 class RestaurantOrchestrator:
     """Central coordinator for restaurant order processing."""
 
@@ -100,6 +91,7 @@ class RestaurantOrchestrator:
         self._nc: nats.NATS | None = None
         self._redis: aioredis.Redis | None = None
         self._pending: dict[str, asyncio.Future[TaskResult]] = {}
+        self._bids: dict[str, list[Bid]] = {}
         self._processed: int = 0
         self._failed: int = 0
 
@@ -107,7 +99,6 @@ class RestaurantOrchestrator:
     # Lifecycle
     # ------------------------------------------------------------------
     async def start(self) -> None:
-        """Connect to NATS and Redis, start result listener."""
         self._nc = await nats.connect(
             NATS_URL,
             reconnect_time_wait=2,
@@ -115,10 +106,10 @@ class RestaurantOrchestrator:
         )
         self._redis = aioredis.from_url(REDIS_URL, decode_responses=True)
         await self._nc.subscribe("tasks.completed", cb=self._on_result)
+        await self._nc.subscribe("tasks.bids", cb=self._on_bid)
         logger.info("Orchestrator connected — NATS=%s  Redis=%s", NATS_URL, REDIS_URL)
 
     async def stop(self) -> None:
-        """Graceful shutdown."""
         if self._nc:
             await self._nc.drain()
         if self._redis:
@@ -130,10 +121,9 @@ class RestaurantOrchestrator:
         )
 
     # ------------------------------------------------------------------
-    # Result listener
+    # Result + Bid listeners
     # ------------------------------------------------------------------
     async def _on_result(self, msg: nats.aio.client.Msg) -> None:
-        """Handle task results published by agents."""
         try:
             data = json.loads(msg.data.decode())
             result = TaskResult(**data)
@@ -145,14 +135,73 @@ class RestaurantOrchestrator:
         if future and not future.done():
             future.set_result(result)
 
+    async def _on_bid(self, msg: nats.aio.client.Msg) -> None:
+        try:
+            data = json.loads(msg.data.decode())
+            bid = Bid(**data)
+        except Exception as exc:
+            logger.error("Malformed bid message: %s", exc)
+            return
+
+        if bid.task_id in self._bids:
+            self._bids[bid.task_id].append(bid)
+            logger.debug(
+                "Bid received  agent=%s  cost=%.2f  task_id=%s",
+                bid.agent_id, bid.cost, bid.task_id,
+            )
+
     # ------------------------------------------------------------------
-    # Core send / retry
+    # Auction
+    # ------------------------------------------------------------------
+    async def _run_auction(self, task: Task) -> str | None:
+        """
+        Broadcast a bid request, wait BID_WINDOW seconds, return the
+        agent_id with the lowest cost (most available).
+        Returns None if no bids received.
+        """
+        assert self._nc is not None
+        self._bids[task.id] = []
+
+        payload = json.dumps({
+            "id": task.id,
+            "type": task.type,
+            "payload": task.payload,
+            "trace_id": task.trace_id,
+            "retry_count": task.retry_count,
+        }).encode()
+
+        await self._nc.publish("tasks.bid", payload)
+        logger.info(
+            "Auction started  type=%s  task_id=%s  window=%.1fs",
+            task.type, task.id, BID_WINDOW,
+        )
+
+        await asyncio.sleep(BID_WINDOW)
+
+        bids = self._bids.pop(task.id, [])
+        if not bids:
+            logger.warning("No bids received for task_id=%s type=%s", task.id, task.type)
+            return None
+
+        winner = min(bids, key=lambda b: b.cost)
+        logger.info(
+            "Auction won  agent=%s  cost=%.2f  bids=%d  task_id=%s",
+            winner.agent_id, winner.cost, len(bids), task.id,
+        )
+        return winner.agent_id
+
+    # ------------------------------------------------------------------
+    # Core send  (auction → direct → fallback broadcast)
     # ------------------------------------------------------------------
     async def send_task(self, task: Task, timeout: int = TASK_TIMEOUT) -> TaskResult:
         """
-        Send a task to agents and await the result.
+        Send a task using auction-based agent selection.
 
-        Retries up to MAX_RETRIES times on failure with exponential back-off.
+        Flow:
+          1. Run auction — broadcast to tasks.bid, collect bids for BID_WINDOW s
+          2. Send task directly to winning agent via tasks.direct.{agent_id}
+          3. If no bids (no agents yet) — fall back to broadcast tasks.process
+          4. Retry up to MAX_RETRIES times on timeout or agent failure
         """
         assert self._nc is not None
 
@@ -160,49 +209,48 @@ class RestaurantOrchestrator:
             task.retry_count = attempt - 1
             task.id = str(uuid.uuid4())
 
-            future: asyncio.Future[TaskResult] = asyncio.get_event_loop().create_future()
+            future: asyncio.Future[TaskResult] = asyncio.get_running_loop().create_future()
             self._pending[task.id] = future
 
-            payload = json.dumps(
-                {
-                    "id": task.id,
-                    "type": task.type,
-                    "payload": task.payload,
-                    "trace_id": task.trace_id,
-                    "retry_count": task.retry_count,
-                }
-            ).encode()
-            await self._nc.publish("tasks.process", payload)
-            logger.info(
-                "Task sent  type=%s  id=%s  attempt=%d/%d",
-                task.type,
-                task.id,
-                attempt,
-                MAX_RETRIES,
-            )
+            payload = json.dumps({
+                "id": task.id,
+                "type": task.type,
+                "payload": task.payload,
+                "trace_id": task.trace_id,
+                "retry_count": task.retry_count,
+            }).encode()
+
+            # --- Auction phase ---
+            winner_agent = await self._run_auction(task)
+
+            if winner_agent:
+                # Send directly to the winning agent
+                await self._nc.publish(f"tasks.direct.{winner_agent}", payload)
+                logger.info(
+                    "Task dispatched via auction  type=%s  agent=%s  attempt=%d/%d",
+                    task.type, winner_agent, attempt, MAX_RETRIES,
+                )
+            else:
+                # Fallback: broadcast (handles cold-start / no agents available)
+                await self._nc.publish("tasks.process", payload)
+                logger.info(
+                    "Task dispatched via broadcast (no bids)  type=%s  attempt=%d/%d",
+                    task.type, attempt, MAX_RETRIES,
+                )
 
             try:
                 result = await asyncio.wait_for(future, timeout=timeout)
                 if result.success:
                     self._processed += 1
                     return result
-                # Agent returned failure — retry
                 logger.warning(
-                    "Task failed (agent error) type=%s id=%s error=%s — retrying",
-                    task.type,
-                    task.id,
-                    result.error,
+                    "Task failed (agent error)  type=%s  error=%s — retrying",
+                    task.type, result.error,
                 )
             except TimeoutError:
                 self._pending.pop(task.id, None)
-                logger.warning(
-                    "Task timeout  type=%s  attempt=%d/%d",
-                    task.type,
-                    attempt,
-                    MAX_RETRIES,
-                )
+                logger.warning("Task timeout  type=%s  attempt=%d/%d", task.type, attempt, MAX_RETRIES)
 
-            # Exponential back-off before next attempt
             await asyncio.sleep(2 ** (attempt - 1))
 
         self._failed += 1
@@ -215,10 +263,8 @@ class RestaurantOrchestrator:
         self, order: dict[str, Any], step_timeout: int = TASK_TIMEOUT
     ) -> dict[str, Any]:
         """
-        Full pipeline: validate → assign_table → cook → deliver.
-
-        Each step's output feeds into the next step's payload.
-        ``step_timeout`` controls per-step timeout (default 30s; lower in tests).
+        Full pipeline: validate_order → assign_table → cook_dish → deliver_order.
+        Each step uses auction-based agent selection.
         """
         order_id = order.get("order_id") or str(uuid.uuid4())
         order["order_id"] = order_id
@@ -226,29 +272,24 @@ class RestaurantOrchestrator:
 
         with tracer.start_as_current_span("process_order") as span:
             span.set_attribute("order.id", order_id)
-
-            # Save initial status
             await self._save_status(order_id, "received", order)
 
             try:
-                # Step 1: Validate order
-                logger.info("[%s] Step 1 — validate_order", order_id)
+                logger.info("[%s] Step 1 — validate_order (auction)", order_id)
                 r1 = await self.send_task(
                     Task(id="", type="validate_order", payload=order, trace_id=trace_id),
                     timeout=step_timeout,
                 )
                 await self._save_status(order_id, "validated", r1.output)
 
-                # Step 2: Assign table
-                logger.info("[%s] Step 2 — assign_table", order_id)
+                logger.info("[%s] Step 2 — assign_table (auction)", order_id)
                 r2 = await self.send_task(
                     Task(id="", type="assign_table", payload=r1.output, trace_id=trace_id),
                     timeout=step_timeout,
                 )
                 await self._save_status(order_id, "table_assigned", r2.output)
 
-                # Step 3: Cook dishes
-                logger.info("[%s] Step 3 — cook_dish", order_id)
+                logger.info("[%s] Step 3 — cook_dish (auction)", order_id)
                 cook_payload = {**r1.output, **r2.output}
                 r3 = await self.send_task(
                     Task(id="", type="cook_dish", payload=cook_payload, trace_id=trace_id),
@@ -256,14 +297,33 @@ class RestaurantOrchestrator:
                 )
                 await self._save_status(order_id, "cooking", r3.output)
 
-                # Step 4: Deliver to table
-                logger.info("[%s] Step 4 — deliver_order", order_id)
+                logger.info("[%s] Step 4 — deliver_order (auction)", order_id)
                 delivery_payload = {**r3.output, "table_number": r2.output.get("table_number")}
                 r4 = await self.send_task(
                     Task(id="", type="deliver_order", payload=delivery_payload, trace_id=trace_id),
                     timeout=step_timeout,
                 )
                 await self._save_status(order_id, "delivered", r4.output)
+
+                # Step 5: LLM analysis — runs after delivery, best-effort (non-blocking)
+                logger.info("[%s] Step 5 — analyze_order (LLM agent, auction)", order_id)
+                llm_output: dict[str, Any] = {}
+                try:
+                    llm_payload = {
+                        "order_id": order_id,
+                        "items": r1.output.get("items", []),
+                        "total": r1.output.get("total", 0),
+                        "customer_name": order.get("customer_name", "Гость"),
+                    }
+                    r5 = await self.send_task(
+                        Task(id="", type="analyze_order", payload=llm_payload, trace_id=trace_id),
+                        timeout=min(step_timeout, 15),
+                    )
+                    llm_output = r5.output
+                    await self._save_status(order_id, "analyzed", llm_output)
+                except Exception as llm_exc:
+                    # LLM step is non-critical — order is already delivered
+                    logger.warning("[%s] LLM analysis skipped: %s", order_id, llm_exc)
 
                 logger.info("[%s] Order pipeline complete ✓", order_id)
                 return {
@@ -272,11 +332,13 @@ class RestaurantOrchestrator:
                     "table_number": r2.output.get("table_number"),
                     "total": r1.output.get("total"),
                     "delivered_at": r4.output.get("delivered_at"),
+                    "recommendation": llm_output.get("recommendation", ""),
                     "steps": {
                         "validate": r1.output,
                         "table": r2.output,
                         "kitchen": r3.output,
                         "delivery": r4.output,
+                        "llm": llm_output,
                     },
                 }
 
@@ -287,18 +349,15 @@ class RestaurantOrchestrator:
                 raise
 
     # ------------------------------------------------------------------
-    # Redis state helpers
+    # Redis helpers
     # ------------------------------------------------------------------
-    async def _save_status(
-        self, order_id: str, status: str, data: dict[str, Any]
-    ) -> None:
+    async def _save_status(self, order_id: str, status: str, data: dict[str, Any]) -> None:
         if not self._redis:
             return
         key = f"order:status:{order_id}"
         serialisable = {k: str(v) for k, v in data.items()}
         await self._redis.hset(key, mapping={"status": status, **serialisable})
         await self._redis.expire(key, 86400)
-        # Append to order event log
         await self._redis.rpush(
             f"order:log:{order_id}",
             json.dumps({"status": status, "data": data}),
@@ -306,14 +365,12 @@ class RestaurantOrchestrator:
         await self._redis.expire(f"order:log:{order_id}", 86400)
 
     async def get_order_status(self, order_id: str) -> dict[str, Any] | None:
-        """Retrieve order status from Redis."""
         if not self._redis:
             return None
         data = await self._redis.hgetall(f"order:status:{order_id}")
         return data or None
 
     async def get_metrics(self) -> dict[str, Any]:
-        """Return orchestrator metrics."""
         return {
             "processed": self._processed,
             "failed": self._failed,

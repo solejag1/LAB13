@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -38,12 +39,20 @@ type TaskResult struct {
 	TraceID string                 `json:"trace_id"`
 }
 
+type Bid struct {
+	TaskID   string  `json:"task_id"`
+	AgentID  string  `json:"agent_id"`
+	Cost     float64 `json:"cost"`
+	TaskType string  `json:"task_type"`
+}
+
 var (
 	agentID   = getenv("AGENT_ID", "delivery-agent-1")
 	natsURL   = getenv("NATS_URL", "nats://localhost:4222")
 	redisURL  = getenv("REDIS_URL", "redis://localhost:6379")
 	otlpEndpt = getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
-	processed int64
+	processed atomic.Int64
+	active    atomic.Int64
 	logger    = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	rdb       *redis.Client
 )
@@ -87,7 +96,10 @@ func initTracer(ctx context.Context) (*sdktrace.TracerProvider, error) {
 	return tp, nil
 }
 
-// deliverOrder marks the order as delivered and cleans up Redis state.
+func currentCost() float64 {
+	return 1.0 + float64(active.Load())*3.0
+}
+
 func deliverOrder(ctx context.Context, payload map[string]interface{}) (map[string]interface{}, error) {
 	orderID, ok := payload["order_id"].(string)
 	if !ok || orderID == "" {
@@ -98,38 +110,32 @@ func deliverOrder(ctx context.Context, payload map[string]interface{}) (map[stri
 		return nil, fmt.Errorf("missing or invalid table_number")
 	}
 
-	// Simulate delivery walk time
 	time.Sleep(300 * time.Millisecond)
-
 	deliveredAt := time.Now().UTC().Format(time.RFC3339)
 
-	// Update order status in Redis
-	orderKey := fmt.Sprintf("order:status:%s", orderID)
-	if err := rdb.HSet(ctx, orderKey,
-		"status", "delivered",
-		"delivered_at", deliveredAt,
-		"delivered_by", agentID,
-	).Err(); err != nil {
-		logger.Warn("redis update status", "error", err)
-	}
-	rdb.Expire(ctx, orderKey, 24*time.Hour)
+	if rdb != nil {
+		orderKey := fmt.Sprintf("order:status:%s", orderID)
+		if err := rdb.HSet(ctx, orderKey,
+			"status", "delivered",
+			"delivered_at", deliveredAt,
+			"delivered_by", agentID,
+		).Err(); err != nil {
+			logger.Warn("redis update status", "error", err)
+		}
+		rdb.Expire(ctx, orderKey, 24*time.Hour)
 
-	// Publish order delivered event
-	eventData, _ := json.Marshal(map[string]interface{}{
-		"event":        "order.delivered",
-		"order_id":     orderID,
-		"table_number": tableNum,
-		"delivered_at": deliveredAt,
-	})
-	if err := rdb.Publish(ctx, "restaurant:events", eventData).Err(); err != nil {
-		logger.Warn("redis publish event", "error", err)
+		eventData, _ := json.Marshal(map[string]interface{}{
+			"event":        "order.delivered",
+			"order_id":     orderID,
+			"table_number": tableNum,
+			"delivered_at": deliveredAt,
+		})
+		if err := rdb.Publish(ctx, "restaurant:events", eventData).Err(); err != nil {
+			logger.Warn("redis publish event", "error", err)
+		}
 	}
 
-	logger.Info("order delivered",
-		"order_id", orderID,
-		"table_number", tableNum,
-		"agent", agentID,
-	)
+	logger.Info("order delivered", "order_id", orderID, "table_number", tableNum, "agent", agentID)
 
 	return map[string]interface{}{
 		"order_id":     orderID,
@@ -141,7 +147,9 @@ func deliverOrder(ctx context.Context, payload map[string]interface{}) (map[stri
 }
 
 func handleTask(nc *nats.Conn, msg *nats.Msg) {
-	processed++
+	processed.Add(1)
+	active.Add(1)
+	defer active.Add(-1)
 	start := time.Now()
 
 	var task Task
@@ -149,7 +157,6 @@ func handleTask(nc *nats.Conn, msg *nats.Msg) {
 		logger.Error("unmarshal task", "error", err)
 		return
 	}
-
 	if task.Type != "deliver_order" {
 		return
 	}
@@ -159,18 +166,10 @@ func handleTask(nc *nats.Conn, msg *nats.Msg) {
 	defer span.End()
 	span.SetAttributes(attribute.String("task.id", task.ID))
 
-	logger.Info("processing task",
-		"task_id", task.ID,
-		"agent", agentID,
-		"retry", task.RetryCount,
-	)
+	logger.Info("processing task", "task_id", task.ID, "agent", agentID, "retry", task.RetryCount)
 
 	output, err := deliverOrder(ctx, task.Payload)
-	result := TaskResult{
-		TaskID:  task.ID,
-		AgentID: agentID,
-		TraceID: task.TraceID,
-	}
+	result := TaskResult{TaskID: task.ID, AgentID: agentID, TraceID: task.TraceID}
 	if err != nil {
 		result.Success = false
 		result.Error = err.Error()
@@ -189,8 +188,24 @@ func handleTask(nc *nats.Conn, msg *nats.Msg) {
 		"task_id", task.ID,
 		"success", result.Success,
 		"elapsed_ms", time.Since(start).Milliseconds(),
-		"processed_total", processed,
+		"processed_total", processed.Load(),
 	)
+}
+
+func handleBid(nc *nats.Conn, msg *nats.Msg) {
+	var task Task
+	if err := json.Unmarshal(msg.Data, &task); err != nil {
+		return
+	}
+	if task.Type != "deliver_order" {
+		return
+	}
+	bid := Bid{TaskID: task.ID, AgentID: agentID, Cost: currentCost(), TaskType: task.Type}
+	data, _ := json.Marshal(bid)
+	if err := nc.Publish("tasks.bids", data); err != nil {
+		logger.Error("publish bid", "error", err)
+	}
+	logger.Debug("bid submitted", "task_id", task.ID, "cost", bid.Cost, "active", active.Load())
 }
 
 func main() {
@@ -219,16 +234,28 @@ func main() {
 	}
 	defer nc.Drain()
 
-	sub, err := nc.QueueSubscribe("tasks.process", "delivery-agents", func(msg *nats.Msg) {
-		handleTask(nc, msg)
-	})
+	bidSub, err := nc.Subscribe("tasks.bid", func(msg *nats.Msg) { handleBid(nc, msg) })
 	if err != nil {
-		logger.Error("subscribe", "error", err)
+		logger.Error("subscribe bid", "error", err)
 		os.Exit(1)
 	}
-	defer sub.Unsubscribe()
+	defer bidSub.Unsubscribe()
+
+	directSub, err := nc.Subscribe("tasks.direct."+agentID, func(msg *nats.Msg) { handleTask(nc, msg) })
+	if err != nil {
+		logger.Error("subscribe direct", "error", err)
+		os.Exit(1)
+	}
+	defer directSub.Unsubscribe()
+
+	broadSub, err := nc.QueueSubscribe("tasks.process", "delivery-agents", func(msg *nats.Msg) { handleTask(nc, msg) })
+	if err != nil {
+		logger.Error("subscribe broadcast", "error", err)
+		os.Exit(1)
+	}
+	defer broadSub.Unsubscribe()
 
 	logger.Info("delivery-agent started", "agent_id", agentID, "nats", natsURL)
 	<-ctx.Done()
-	logger.Info("delivery-agent shutting down", "processed", processed)
+	logger.Info("delivery-agent shutting down", "processed", processed.Load())
 }
