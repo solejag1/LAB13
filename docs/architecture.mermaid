@@ -1,0 +1,57 @@
+---
+title: Restaurant MAS — Architecture
+---
+sequenceDiagram
+    participant Client
+    participant API as REST API (FastAPI)
+    participant Orch as Orchestrator (Python)
+    participant NATS
+    participant OA as Order Agent (Go)
+    participant TA as Table Agent (Go+Redis)
+    participant KA as Kitchen Agent ×2 (Go+Redis)
+    participant DA as Delivery Agent (Go+Redis)
+    participant Redis
+    participant Jaeger
+
+    Client->>API: POST /orders {items, table}
+    API->>Orch: process_order(payload)
+
+    Note over Orch: Step 1 — Validate
+    Orch->>NATS: publish tasks.process {type=validate_order}
+    NATS->>OA: deliver (QueueGroup order-agents)
+    OA->>OA: validateOrder()
+    OA->>NATS: publish tasks.completed {success=true}
+    NATS->>Orch: result → Future resolved
+
+    Note over Orch: Step 2 — Assign Table
+    Orch->>NATS: publish tasks.process {type=assign_table}
+    NATS->>TA: deliver
+    TA->>Redis: SET table:occupied:N order_id
+    TA->>NATS: publish tasks.completed
+    NATS->>Orch: result
+
+    Note over Orch: Step 3 — Cook
+    Orch->>NATS: publish tasks.process {type=cook_dish}
+    NATS->>KA: deliver (QueueGroup kitchen-agents, load balanced)
+    KA->>Redis: HSET kitchen:order:{id} status=cooking
+    KA->>KA: simulate cook time
+    KA->>Redis: HSET status=ready
+    KA->>NATS: publish tasks.completed
+    NATS->>Orch: result
+
+    Note over Orch: Step 4 — Deliver
+    Orch->>NATS: publish tasks.process {type=deliver_order}
+    NATS->>DA: deliver
+    DA->>Redis: HSET order:status:{id} delivered
+    DA->>Redis: PUBLISH restaurant:events order.delivered
+    DA->>NATS: publish tasks.completed
+    NATS->>Orch: result
+
+    Orch->>Redis: HSET order:status:{id} delivered
+    Orch-->>API: {status: delivered, total, delivered_at}
+    API-->>Client: 201 OrderResponse
+
+    Note over OA,DA: All agents send OTLP spans
+    OA-->>Jaeger: spans
+    KA-->>Jaeger: spans
+    Orch-->>Jaeger: root span
