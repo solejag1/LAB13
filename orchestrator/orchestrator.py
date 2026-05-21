@@ -212,6 +212,13 @@ class RestaurantOrchestrator:
             future: asyncio.Future[TaskResult] = asyncio.get_running_loop().create_future()
             self._pending[task.id] = future
 
+            # Publish pending count to Redis so the auto-scaler can read it
+            if self._redis:
+                try:
+                    await self._redis.set("orchestrator:pending", len(self._pending), ex=60)
+                except Exception:
+                    pass
+
             payload = json.dumps({
                 "id": task.id,
                 "type": task.type,

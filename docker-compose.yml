@@ -183,3 +183,28 @@ services:
       nats:
         condition: service_healthy
     restart: unless-stopped
+
+  scaler:
+    build:
+      context: ./scaler
+      dockerfile: Dockerfile
+    container_name: lab13_scaler
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - NATS_MONITOR_URL=http://nats:8222
+      - NATS_URL=nats://nats:4222
+      - KITCHEN_AGENT_IMAGE=lab13-kitchen_agent
+      - POLL_INTERVAL=10
+      - SCALE_UP_THRESHOLD=3
+      - SCALE_DOWN_THRESHOLD=1
+      - MIN_INSTANCES=1
+      - MAX_INSTANCES=5
+    volumes:
+      # Mount Docker socket so scaler can spawn containers
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
