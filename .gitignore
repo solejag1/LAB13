@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Go binaries only (NOT go.sum — keep it!)
+agents/order_agent/order_agent
+agents/kitchen_agent/kitchen_agent
+agents/table_agent/table_agent
+agents/delivery_agent/delivery_agent
+agents/*/*.exe
+
+# IDE
+.idea/
+.vscode/
+*.iml

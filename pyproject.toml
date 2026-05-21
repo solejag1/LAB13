@@ -1,0 +1,23 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = [".", "api"]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+omit = [
+    "api/dashboard.py",
+    "orchestrator/main.py",
+    "tests/*",
+]
+
+[tool.coverage.report]
+fail_under = 75
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501"]

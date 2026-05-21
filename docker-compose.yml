@@ -1,0 +1,171 @@
+version: "3.9"
+
+services:
+  nats:
+    image: nats:2.10-alpine
+    container_name: lab13_nats
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command: ["-m", "8222"]
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "4222"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: lab13_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: lab13_jaeger
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+
+  order_agent:
+    build:
+      context: ./agents/order_agent
+      dockerfile: Dockerfile
+    container_name: lab13_order_agent
+    environment:
+      - NATS_URL=nats://nats:4222
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      - AGENT_ID=order-agent-1
+    depends_on:
+      nats:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+    restart: unless-stopped
+
+  kitchen_agent:
+    build:
+      context: ./agents/kitchen_agent
+      dockerfile: Dockerfile
+    container_name: lab13_kitchen_agent
+    environment:
+      - NATS_URL=nats://nats:4222
+      - REDIS_URL=redis://redis:6379
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      - AGENT_ID=kitchen-agent-1
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+    restart: unless-stopped
+
+  kitchen_agent_2:
+    build:
+      context: ./agents/kitchen_agent
+      dockerfile: Dockerfile
+    container_name: lab13_kitchen_agent_2
+    environment:
+      - NATS_URL=nats://nats:4222
+      - REDIS_URL=redis://redis:6379
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      - AGENT_ID=kitchen-agent-2
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  table_agent:
+    build:
+      context: ./agents/table_agent
+      dockerfile: Dockerfile
+    container_name: lab13_table_agent
+    environment:
+      - NATS_URL=nats://nats:4222
+      - REDIS_URL=redis://redis:6379
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      - AGENT_ID=table-agent-1
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  delivery_agent:
+    build:
+      context: ./agents/delivery_agent
+      dockerfile: Dockerfile
+    container_name: lab13_delivery_agent
+    environment:
+      - NATS_URL=nats://nats:4222
+      - REDIS_URL=redis://redis:6379
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      - AGENT_ID=delivery-agent-1
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    container_name: lab13_orchestrator
+    environment:
+      - NATS_URL=nats://nats:4222
+      - REDIS_URL=redis://redis:6379
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: lab13_api
+    ports:
+      - "8000:8000"
+    environment:
+      - NATS_URL=nats://nats:4222
+      - REDIS_URL=redis://redis:6379
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ./api
+      dockerfile: Dockerfile.dashboard
+    container_name: lab13_dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      - API_URL=http://api:8000
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - api
+      - redis
+    restart: unless-stopped
